@@ -80,20 +80,20 @@ body {
 .upload-section {
   display: flex;
   justify-content: center;
-  align-items: center;
+  align-items: flex-start;
   min-height: 60vh;
+  padding: 1rem 0;
 }
 
 .upload-container {
   background: rgba(255, 255, 255, 0.95);
   backdrop-filter: blur(10px);
   border-radius: 20px;
-  padding: 3rem;
+  padding: 2.5rem;
   box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
   border: 2px dashed #cbd5e0;
-  transition: all 0.3s ease;
-  text-align: center;
-  max-width: 500px;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease, transform 0.3s ease;
+  max-width: 640px;
   width: 100%;
 }
 
@@ -105,6 +105,7 @@ body {
 
 .upload-area {
   cursor: pointer;
+  text-align: center;
 }
 
 .upload-icon {
@@ -242,6 +243,18 @@ body {
 .controls {
   display: flex;
   gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.edf-save-message {
+  color: #38a169;
+  font-size: 0.85rem;
+}
+
+.edf-save-error {
+  color: #e53e3e;
+  font-size: 0.85rem;
 }
 
 .btn {
@@ -296,6 +309,40 @@ body {
 
 .channel-controls-header h3 {
   margin-bottom: 0;
+}
+
+.overview-channel-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 1rem;
+  padding: 0.75rem 1rem;
+  background: #edf2f7;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.overview-channel-picker-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #4a5568;
+}
+
+.overview-channel-select {
+  width: 100%;
+  max-width: 320px;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid #cbd5e0;
+  border-radius: 6px;
+  background: white;
+  font-size: 0.9rem;
+  color: #2d3748;
+}
+
+.overview-channel-select:focus {
+  outline: none;
+  border-color: #667eea;
+  box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2);
 }
 
 .channel-controls h3 {
@@ -623,6 +670,93 @@ body {
   margin-top: 1rem;
   color: #e53e3e;
   font-size: 0.9rem;
+  text-align: center;
+}
+
+.upload-divider {
+  margin: 2rem 0 1.5rem;
+  border-top: 1px solid #e2e8f0;
+}
+
+.saved-edf-section {
+  text-align: left;
+}
+
+.saved-edf-header {
+  margin-bottom: 0.75rem;
+}
+
+.saved-edf-header h3 {
+  color: #2d3748;
+  margin-bottom: 0.25rem;
+  font-size: 1.1rem;
+}
+
+.saved-edf-hint {
+  color: #718096;
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.saved-edf-message {
+  color: #38a169;
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.saved-edf-error {
+  color: #e53e3e;
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.saved-edf-empty {
+  color: #718096;
+  font-size: 0.9rem;
+}
+
+.saved-edf-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.saved-edf-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.875rem 1rem;
+  background: #f7fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.saved-edf-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.saved-edf-name {
+  font-weight: 600;
+  color: #2d3748;
+  word-break: break-word;
+}
+
+.saved-edf-meta {
+  color: #718096;
+  font-size: 0.8rem;
+}
+
+.saved-edf-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
 }
 
 /* Signal display */
@@ -687,6 +821,22 @@ body {
   color: #4a5568;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.overview-strip-label .channel-strip-label-text {
+  font-size: 11px;
+  color: #667eea;
+  font-weight: 600;
+}
+
+.overview-strip-region {
+  position: absolute;
+  z-index: 4;
+  cursor: pointer;
+}
+
+.overview-strip-region:hover {
+  background: rgba(102, 126, 234, 0.06);
 }
 
 .signal-canvas {
@@ -833,6 +983,15 @@ body.signal-viewer-reordering .channel-yzoom-region {
   
   .upload-container {
     padding: 2rem 1rem;
+  }
+
+  .saved-edf-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .saved-edf-actions {
+    justify-content: flex-end;
   }
   
   .viewer-header {

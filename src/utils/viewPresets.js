@@ -1,23 +1,6 @@
-const DB_NAME = 'edfviewer'
-const DB_VERSION = 1
-const STORE_NAME = 'viewPresets'
+import { openDb, VIEW_PRESETS_STORE } from './edfDb'
 
-function openDb() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION)
-
-    request.onerror = () => reject(request.error)
-    request.onsuccess = () => resolve(request.result)
-    request.onupgradeneeded = (event) => {
-      const db = event.target.result
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true })
-        store.createIndex('name', 'name', { unique: false })
-        store.createIndex('updatedAt', 'updatedAt', { unique: false })
-      }
-    }
-  })
-}
+const STORE_NAME = VIEW_PRESETS_STORE
 
 export async function listViewPresets() {
   const db = await openDb()

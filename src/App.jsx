@@ -3,6 +3,7 @@ import Header from './components/Header'
 import FileUpload from './components/FileUpload'
 import SignalViewer from './components/SignalViewer'
 import { parseEdfFile } from './utils/edfParser'
+import { getEdfRecord } from './utils/edfStorage'
 import './styles/App.css'
 
 function App() {
@@ -14,14 +15,36 @@ function App() {
     setIsLoading(true)
     setError(null)
     try {
-      const parsed = await parseEdfFile(file)
+      const rawBuffer = await file.arrayBuffer()
+      const parsed = await parseEdfFile(rawBuffer)
       setEdfData({
         fileName: file.name,
+        rawBuffer,
         ...parsed,
       })
     } catch (uploadError) {
       console.error('Error processing EDF file:', uploadError)
       setError(uploadError.message || 'Failed to parse EDF file')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleLoadSavedEdf = async (id) => {
+    setIsLoading(true)
+    setError(null)
+    try {
+      const record = await getEdfRecord(id)
+      const parsed = await parseEdfFile(record.rawBuffer)
+      setEdfData({
+        fileName: record.fileName,
+        rawBuffer: record.rawBuffer,
+        savedRecordId: record.id,
+        ...parsed,
+      })
+    } catch (loadError) {
+      console.error('Error loading saved EDF:', loadError)
+      setError(loadError.message || 'Failed to load saved EDF')
     } finally {
       setIsLoading(false)
     }
@@ -39,6 +62,7 @@ function App() {
         {!edfData ? (
           <FileUpload
             onFileUpload={handleFileUpload}
+            onLoadSavedEdf={handleLoadSavedEdf}
             isLoading={isLoading}
             error={error}
           />
