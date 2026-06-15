@@ -2,22 +2,26 @@ import React, { useState } from 'react'
 import Header from './components/Header'
 import FileUpload from './components/FileUpload'
 import SignalViewer from './components/SignalViewer'
+import { parseEdfFile } from './utils/edfParser'
 import './styles/App.css'
 
 function App() {
   const [edfData, setEdfData] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState(null)
 
   const handleFileUpload = async (file) => {
     setIsLoading(true)
+    setError(null)
     try {
-      // TODO: Implement EDF parsing logic
-      console.log('Processing EDF file:', file.name)
-      // Simulate processing time
-      await new Promise(resolve => setTimeout(resolve, 2000))
-      setEdfData({ fileName: file.name, channels: [] })
-    } catch (error) {
-      console.error('Error processing EDF file:', error)
+      const parsed = await parseEdfFile(file)
+      setEdfData({
+        fileName: file.name,
+        ...parsed,
+      })
+    } catch (uploadError) {
+      console.error('Error processing EDF file:', uploadError)
+      setError(uploadError.message || 'Failed to parse EDF file')
     } finally {
       setIsLoading(false)
     }
@@ -25,17 +29,22 @@ function App() {
 
   const handleBackToUpload = () => {
     setEdfData(null)
+    setError(null)
   }
 
   return (
     <div className="app">
       <Header />
-      <main className="main-content">
+      <main className={`main-content${edfData ? ' main-content--viewer' : ''}`}>
         {!edfData ? (
-          <FileUpload onFileUpload={handleFileUpload} isLoading={isLoading} />
+          <FileUpload
+            onFileUpload={handleFileUpload}
+            isLoading={isLoading}
+            error={error}
+          />
         ) : (
-          <SignalViewer 
-            edfData={edfData} 
+          <SignalViewer
+            edfData={edfData}
             onBack={handleBackToUpload}
           />
         )}
