@@ -6,6 +6,18 @@ import { parseEdfFile } from './utils/edfParser'
 import { getEdfRecord } from './utils/edfStorage'
 import './styles/App.css'
 
+function toArrayBuffer(value) {
+  if (value instanceof ArrayBuffer) {
+    return value
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)
+  }
+
+  throw new Error('Saved EDF data is missing or invalid')
+}
+
 function App() {
   const [edfData, setEdfData] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
@@ -35,10 +47,11 @@ function App() {
     setError(null)
     try {
       const record = await getEdfRecord(id)
-      const parsed = await parseEdfFile(record.rawBuffer)
+      const rawBuffer = toArrayBuffer(record.rawBuffer)
+      const parsed = await parseEdfFile(rawBuffer)
       setEdfData({
         fileName: record.fileName,
-        rawBuffer: record.rawBuffer,
+        rawBuffer,
         savedRecordId: record.id,
         ...parsed,
       })

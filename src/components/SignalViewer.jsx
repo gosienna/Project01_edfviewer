@@ -1,6 +1,11 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { deleteViewPreset, listViewPresets, saveViewPreset, updateViewPresetById } from '../utils/viewPresets'
-import { buildEdfSummary, saveEdfRecord } from '../utils/edfStorage'
+import { deleteBinaryMaskEdit, getBinaryMaskEdits, saveBinaryMaskEdit } from '../utils/binaryMaskStorage'
+import { buildEdfSummary, deleteEdfRecord, findEdfRecordsByFileName, saveEdfRecord, updateEdfRecord } from '../utils/edfStorage'
+import { buildEdfBuffer } from '../utils/edfWriter'
+import ChannelYRangeDialog from './ChannelYRangeDialog'
+import ExportDataDialog from './ExportDataDialog'
+import SaveEdfConflictDialog from './SaveEdfConflictDialog'
 
 const CHANNEL_COLORS = [
   '#667eea', '#e53e3e', '#38a169', '#d69e2e', '#805ad5',
@@ -49,7 +54,7 @@ const WHEEL_ZOOM_BASE = 1.15
 const DEFAULT_CHANNEL_STRIP_HEIGHT = 80
 const MIN_CHANNEL_STRIP_HEIGHT = 40
 const MIN_PANEL_HEIGHT = 200
-const DEFAULT_PANEL_HEIGHT = 450
+const DEFAULT_PANEL_HEIGHT = 600
 const PANEL_RESIZE_HANDLE_HEIGHT = 10
 const Y_VALUE_REGION_WIDTH = 88
 const Y_WHEEL_ZOOM_BASE = 1.15
@@ -108,6 +113,74 @@ function isBinarySignal(data) {
 
 function isActiveBinary(value) {
   return value > 0.5
+}
+
+function clientXToTime(clientX, canvas, viewStart, viewEnd) {
+  const rect = canvas.getBoundingClientRect()
+  if (rect.width <= 0) return viewStart
+
+  const scaleX = canvas.width / rect.width
+  const mouseX = (clientX - rect.left) * scaleX
+  const plotWidth = canvas.width - PLOT_PADDING.left - PLOT_PADDING.right
+  if (plotWidth <= 0) return viewStart
+
+  const fraction = Math.max(0, Math.min(1, (mouseX - PLOT_PADDING.left) / plotWidth))
+  return viewStart + fraction * (viewEnd - viewStart)
+}
+
+function timeToSampleIndex(time, sampleRate, dataLength) {
+  const index = Math.round(time * sampleRate)
+  return Math.max(0, Math.min(dataLength - 1, index))
+}
+
+function findActiveEventBounds(data, sampleIndex) {
+  if (sampleIndex < 0 || sampleIndex >= data.length) return null
+  if (!isActiveBinary(data[sampleIndex])) return null
+
+  let start = sampleIndex
+  let end = sampleIndex
+
+  while (start > 0 && isActiveBinary(data[start - 1])) start -= 1
+  while (end < data.length - 1 && isActiveBinary(data[end + 1])) end += 1
+
+  return { start, end }
+}
+
+function clearEventAt(data, sampleIndex) {
+  const bounds = findActiveEventBounds(data, sampleIndex)
+  if (!bounds) return null
+
+  const next = data.slice()
+  for (let i = bounds.start; i <= bounds.end; i += 1) {
+    next[i] = 0
+  }
+  return next
+}
+
+function fillEventRange(data, startSample, endSample) {
+  const start = Math.max(0, Math.min(startSample, endSample))
+  const end = Math.min(data.length - 1, Math.max(startSample, endSample))
+  const next = data.slice()
+  for (let i = start; i <= end; i += 1) {
+    next[i] = 1
+  }
+  return next
+}
+
+function maskBufferToArray(maskBuffer, expectedLength) {
+  const values = Array.from(new Float32Array(maskBuffer))
+  if (expectedLength > 0 && values.length !== expectedLength) {
+    return values.slice(0, expectedLength)
+  }
+  return values
+}
+
+const MAX_MASK_UNDO_HISTORY = 50
+
+function cloneMaskOverrides(overrides) {
+  return Object.fromEntries(
+    Object.entries(overrides ?? {}).map(([id, data]) => [id, data.slice()])
+  )
 }
 
 function getBinaryMaskSegments(data, startIndex, endIndex, targetPoints) {
@@ -212,6 +285,22 @@ function reorderArray(array, fromIndex, toIndex) {
   const [item] = next.splice(fromIndex, 1)
   next.splice(toIndex, 0, item)
   return next
+}
+
+function attachDocumentDragListeners(onMove, onEnd) {
+  document.addEventListener('pointermove', onMove)
+  document.addEventListener('pointerup', onEnd)
+  document.addEventListener('pointercancel', onEnd)
+}
+
+function detachDocumentDragListeners(onMove, onEnd) {
+  document.removeEventListener('pointermove', onMove)
+  document.removeEventListener('pointerup', onEnd)
+  document.removeEventListener('pointercancel', onEnd)
+}
+
+function isPrimaryPointerButton(event) {
+  return event.button === 0
 }
 
 function getChannelIndexAtCanvasY(clientY, canvas, channels, channelStripHeights) {
@@ -372,6 +461,56 @@ function getVisibleValueRange(minVal, maxVal, yZoom) {
   }
 }
 
+function getChannelDisplayRange({
+  channel,
+  viewStart,
+  viewEnd,
+  plotWidth,
+  channelYZoom,
+  channelYRange,
+}) {
+  const startSample = viewStart * channel.sampleRate
+  const endSample = viewEnd * channel.sampleRate
+  const samples = downsampleRange(channel.data, startSample, endSample, plotWidth)
+
+  if (samples.length === 0) {
+    return {
+      displayMin: 0,
+      displayMax: 1,
+      displayRange: 1,
+      isCustom: false,
+      samples,
+    }
+  }
+
+  let minVal = Infinity
+  let maxVal = -Infinity
+  samples.forEach(({ min, max }) => {
+    if (min < minVal) minVal = min
+    if (max > maxVal) maxVal = max
+  })
+
+  const override = channelYRange[channel.id]
+  if (
+    override &&
+    Number.isFinite(override.min) &&
+    Number.isFinite(override.max) &&
+    override.min < override.max
+  ) {
+    return {
+      displayMin: override.min,
+      displayMax: override.max,
+      displayRange: override.max - override.min,
+      isCustom: true,
+      samples,
+    }
+  }
+
+  const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
+  const { displayMin, displayMax, displayRange } = getVisibleValueRange(minVal, maxVal, yZoom)
+  return { displayMin, displayMax, displayRange, isCustom: false, samples }
+}
+
 function clipToChannelStrip(ctx, xLeft, plotWidth, yTop, stripHeight) {
   ctx.save()
   ctx.beginPath()
@@ -419,6 +558,17 @@ function getChannelBoundaryPercents(activeChannels, channelStripHeights, canvasH
   }
 
   return boundaries
+}
+
+function getLastChannelBottomPercent(activeChannels, channelStripHeights, canvasHeight) {
+  if (activeChannels.length === 0 || canvasHeight <= 0) return null
+
+  let offset = getDetailChannelsTop()
+  activeChannels.forEach((channel) => {
+    offset += getChannelStripHeight(channelStripHeights, channel.id)
+  })
+
+  return (offset / canvasHeight) * 100
 }
 
 function downsampleRange(data, startIndex, endIndex, targetPoints) {
@@ -470,6 +620,7 @@ function buildViewParams({
   binaryMaskOverlays,
   channelStripHeights,
   channelYZoom,
+  channelYRange,
   overviewChannelId,
   windowSeconds,
   viewStart,
@@ -504,6 +655,7 @@ function buildViewParams({
     binaryMaskOverlaysByLabel: mapOverlayIdsToLabels(resolvedOverlays, channelById),
     channelStripHeightsByLabel: mapIdsToLabels(channelStripHeights, channelById),
     channelYZoomByLabel: mapIdsToLabels(channelYZoom, channelById),
+    channelYRangeByLabel: mapIdsToLabels(channelYRange, channelById),
     windowSeconds,
     viewStart,
     panelHeight,
@@ -531,6 +683,7 @@ function normalizeViewParams(params) {
     binaryMaskOverlaysByLabel: normalizeOverlayLabelRecord(params.binaryMaskOverlaysByLabel),
     channelStripHeightsByLabel: normalizeChannelLabelRecord(params.channelStripHeightsByLabel),
     channelYZoomByLabel: normalizeChannelLabelRecord(params.channelYZoomByLabel),
+    channelYRangeByLabel: normalizeChannelLabelRecord(params.channelYRangeByLabel),
     windowSeconds: params.windowSeconds,
     viewStart: params.viewStart,
     panelHeight: params.panelHeight ?? DEFAULT_PANEL_HEIGHT,
@@ -547,6 +700,7 @@ function resolveFullViewParams(params, edfData, totalDuration) {
     binaryMaskOverlays: applied.binaryMaskOverlays,
     channelStripHeights: applied.channelStripHeights,
     channelYZoom: applied.channelYZoom,
+    channelYRange: applied.channelYRange,
     overviewChannelId: applied.overviewChannelId,
     windowSeconds: applied.windowSeconds,
     viewStart: applied.viewStart,
@@ -612,6 +766,19 @@ function applyViewParams(params, edfData, totalDuration) {
     yZoom[id] = Math.max(MIN_Y_ZOOM, Math.min(MAX_Y_ZOOM, zoom))
   })
 
+  const yRange = {}
+  Object.entries(params.channelYRangeByLabel ?? {}).forEach(([label, range]) => {
+    const id = labelToId[label]
+    if (id === undefined || !range) return
+    if (
+      Number.isFinite(range.min) &&
+      Number.isFinite(range.max) &&
+      range.min < range.max
+    ) {
+      yRange[id] = { min: range.min, max: range.max }
+    }
+  })
+
   const nextWindowSeconds = Math.max(
     MIN_WINDOW_SECONDS,
     Math.min(totalDuration, params.windowSeconds ?? 60)
@@ -649,6 +816,7 @@ function applyViewParams(params, edfData, totalDuration) {
     binaryMaskOverlays,
     channelStripHeights: stripHeights,
     channelYZoom: yZoom,
+    channelYRange: yRange,
     overviewChannelId,
     windowSeconds: nextWindowSeconds,
     viewStart: nextViewStart,
@@ -661,6 +829,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   const canvasRef = useRef(null)
   const canvasWrapRef = useRef(null)
   const containerRef = useRef(null)
+  const overviewStripRef = useRef(null)
   const [selectedChannels, setSelectedChannels] = useState(() =>
     getDefaultSelection(edfData.channels)
   )
@@ -672,6 +841,7 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [panelHeight, setPanelHeight] = useState(DEFAULT_PANEL_HEIGHT)
   const [channelStripHeights, setChannelStripHeights] = useState({})
   const [channelYZoom, setChannelYZoom] = useState({})
+  const [channelYRange, setChannelYRange] = useState({})
   const [overviewChannelId, setOverviewChannelId] = useState(() =>
     getDefaultOverviewChannelId(edfData.channels, getDefaultSelection(edfData.channels))
   )
@@ -683,9 +853,17 @@ const SignalViewer = ({ edfData, onBack }) => {
   const [presetsLoading, setPresetsLoading] = useState(true)
   const [loadedPresetId, setLoadedPresetId] = useState(null)
   const [reorderingChannelId, setReorderingChannelId] = useState(null)
+  const [panningYCenterChannelId, setPanningYCenterChannelId] = useState(null)
+  const [yRangeDialog, setYRangeDialog] = useState(null)
   const [edfSaveMessage, setEdfSaveMessage] = useState('')
   const [edfSaveError, setEdfSaveError] = useState('')
   const [isSavingEdf, setIsSavingEdf] = useState(false)
+  const [isExportDialogOpen, setIsExportDialogOpen] = useState(false)
+  const [saveConflict, setSaveConflict] = useState(null)
+  const [savedRecordId, setSavedRecordId] = useState(edfData.savedRecordId ?? null)
+  const [maskOverrides, setMaskOverrides] = useState({})
+  const [maskSelection, setMaskSelection] = useState(null)
+  const [maskHistory, setMaskHistory] = useState([])
 
   const totalDuration = edfData.totalDuration
   const viewEnd = Math.min(viewStart + windowSeconds, totalDuration)
@@ -694,6 +872,12 @@ const SignalViewer = ({ edfData, onBack }) => {
     () => Object.fromEntries(edfData.channels.map((ch) => [ch.id, ch])),
     [edfData.channels]
   )
+
+  const channelByIdRef = useRef(channelById)
+
+  useEffect(() => {
+    channelByIdRef.current = channelById
+  }, [channelById])
 
   const activeChannels = useMemo(
     () => selectedChannels.map((id) => channelById[id]).filter(Boolean),
@@ -724,6 +908,11 @@ const SignalViewer = ({ edfData, onBack }) => {
     [activeChannels, channelStripHeights, canvasHeight]
   )
 
+  const lastChannelBottomPercent = useMemo(
+    () => getLastChannelBottomPercent(activeChannels, channelStripHeights, canvasHeight),
+    [activeChannels, channelStripHeights, canvasHeight]
+  )
+
   const channelStripLayouts = useMemo(
     () => getChannelStripLayouts(activeChannels, channelStripHeights, canvasHeight),
     [activeChannels, channelStripHeights, canvasHeight]
@@ -744,11 +933,19 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const panelHeightRef = useRef(panelHeight)
   const channelStripHeightsRef = useRef(channelStripHeights)
+  const channelYZoomRef = useRef(channelYZoom)
+  const channelYRangeRef = useRef(channelYRange)
   const activeChannelsRef = useRef(activeChannels)
   const selectedChannelsRef = useRef(selectedChannels)
   const dragStateRef = useRef(null)
   const onDragMoveRef = useRef(() => {})
   const endDragRef = useRef(() => {})
+  const maskEditDragRef = useRef(null)
+  const savedRecordIdRef = useRef(savedRecordId)
+  const maskOverridesRef = useRef(maskOverrides)
+  const maskHistoryRef = useRef(maskHistory)
+  const viewRangeRef = useRef({ viewStart, viewEnd })
+  const saveEdfResolversRef = useRef(null)
 
   useEffect(() => {
     panelHeightRef.current = panelHeight
@@ -759,12 +956,75 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [channelStripHeights])
 
   useEffect(() => {
+    channelYZoomRef.current = channelYZoom
+  }, [channelYZoom])
+
+  useEffect(() => {
+    channelYRangeRef.current = channelYRange
+  }, [channelYRange])
+
+  useEffect(() => {
     activeChannelsRef.current = activeChannels
   }, [activeChannels])
 
   useEffect(() => {
     selectedChannelsRef.current = selectedChannels
   }, [selectedChannels])
+
+  useEffect(() => {
+    savedRecordIdRef.current = savedRecordId
+  }, [savedRecordId])
+
+  useEffect(() => {
+    maskOverridesRef.current = maskOverrides
+  }, [maskOverrides])
+
+  useEffect(() => {
+    maskHistoryRef.current = maskHistory
+  }, [maskHistory])
+
+  useEffect(() => {
+    viewRangeRef.current = { viewStart, viewEnd }
+  }, [viewStart, viewEnd])
+
+  useEffect(() => {
+    setSavedRecordId(edfData.savedRecordId ?? null)
+    setMaskOverrides({})
+    setMaskSelection(null)
+    setMaskHistory([])
+  }, [edfData.fileName, edfData.savedRecordId])
+
+  useEffect(() => {
+    if (!edfData.savedRecordId) return undefined
+
+    let cancelled = false
+
+    async function loadMaskEdits() {
+      try {
+        const edits = await getBinaryMaskEdits(edfData.savedRecordId)
+        if (cancelled || edits.length === 0) return
+
+        const overrides = {}
+        edits.forEach(({ channelLabel, maskBuffer }) => {
+          const channel = edfData.channels.find((ch) => ch.label === channelLabel)
+          if (!channel) return
+          overrides[channel.id] = maskBufferToArray(maskBuffer, channel.data.length)
+        })
+
+        if (Object.keys(overrides).length > 0) {
+          setMaskOverrides(overrides)
+        }
+      } catch (error) {
+        console.error('Failed to load binary mask edits:', error)
+      }
+    }
+
+    loadMaskEdits()
+
+    return () => {
+      cancelled = true
+    }
+  }, [edfData.savedRecordId, edfData.channels])
 
   useEffect(() => {
     if (!activeChannelKey) return
@@ -801,6 +1061,8 @@ const SignalViewer = ({ edfData, onBack }) => {
     [activeChannels, getChannelFormat]
   )
 
+  const canUndoMaskEdit = maskHistory.length > 0
+
   const getBinaryMaskOverlayTargets = useCallback(
     (maskChannelId) => {
       if (binaryMaskOverlays[maskChannelId]) {
@@ -810,6 +1072,77 @@ const SignalViewer = ({ edfData, onBack }) => {
     },
     [binaryMaskOverlays, selectedChannels, channelFormats]
   )
+
+  const getMaskData = useCallback(
+    (channelId) => maskOverrides[channelId] ?? channelById[channelId]?.data ?? [],
+    [maskOverrides, channelById]
+  )
+
+  const persistMaskToDb = useCallback(async (recordId, channelId, data) => {
+    if (!recordId) return
+
+    const label = channelById[channelId]?.label
+    if (!label) return
+
+    try {
+      await saveBinaryMaskEdit(recordId, label, new Float32Array(data).buffer)
+    } catch (error) {
+      console.error('Failed to save binary mask edit:', error)
+    }
+  }, [channelById])
+
+  const syncMaskOverridesToDb = useCallback(async (recordId, nextOverrides, prevOverrides) => {
+    if (!recordId) return
+
+    const prevIds = new Set(Object.keys(prevOverrides ?? {}))
+    const nextIds = new Set(Object.keys(nextOverrides ?? {}))
+
+    const tasks = [
+      ...Object.entries(nextOverrides ?? {}).map(([channelId, data]) =>
+        persistMaskToDb(recordId, Number(channelId), data)
+      ),
+      ...[...prevIds]
+        .filter((id) => !nextIds.has(id))
+        .map((id) => {
+          const label = channelById[Number(id)]?.label
+          return label ? deleteBinaryMaskEdit(recordId, label) : Promise.resolve()
+        }),
+    ]
+
+    try {
+      await Promise.all(tasks)
+    } catch (error) {
+      console.error('Failed to sync binary mask edits:', error)
+    }
+  }, [persistMaskToDb, channelById])
+
+  const updateMaskAndSave = useCallback((channelId, nextData) => {
+    const snapshot = cloneMaskOverrides(maskOverridesRef.current)
+    setMaskHistory((history) => [...history, snapshot].slice(-MAX_MASK_UNDO_HISTORY))
+    setMaskOverrides((prev) => ({ ...prev, [channelId]: nextData }))
+    persistMaskToDb(savedRecordIdRef.current, channelId, nextData)
+  }, [persistMaskToDb])
+
+  const undoMaskEdit = useCallback(() => {
+    const history = maskHistoryRef.current
+    if (history.length === 0) return
+
+    const previous = history[history.length - 1]
+    const current = maskOverridesRef.current
+
+    setMaskHistory(history.slice(0, -1))
+    setMaskOverrides(previous)
+    syncMaskOverridesToDb(savedRecordIdRef.current, previous, current)
+  }, [syncMaskOverridesToDb])
+
+  const persistAllMaskOverrides = useCallback(async (recordId) => {
+    const overrides = maskOverridesRef.current
+    await Promise.all(
+      Object.entries(overrides).map(([channelId, data]) =>
+        persistMaskToDb(recordId, Number(channelId), data)
+      )
+    )
+  }, [persistMaskToDb])
 
   const refreshPresets = useCallback(async () => {
     try {
@@ -831,6 +1164,7 @@ const SignalViewer = ({ edfData, onBack }) => {
     setBinaryMaskOverlays(next.binaryMaskOverlays)
     setChannelStripHeights(next.channelStripHeights)
     setChannelYZoom(next.channelYZoom)
+    setChannelYRange(next.channelYRange)
     setOverviewChannelId(next.overviewChannelId)
     setWindowSeconds(next.windowSeconds)
     setViewStart(next.viewStart)
@@ -874,6 +1208,7 @@ const SignalViewer = ({ edfData, onBack }) => {
         binaryMaskOverlays,
         channelStripHeights,
         channelYZoom,
+        channelYRange,
         overviewChannelId,
         windowSeconds,
         viewStart,
@@ -887,6 +1222,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       binaryMaskOverlays,
       channelStripHeights,
       channelYZoom,
+      channelYRange,
       overviewChannelId,
       windowSeconds,
       viewStart,
@@ -913,12 +1249,86 @@ const SignalViewer = ({ edfData, onBack }) => {
     binaryMaskOverlays,
     channelStripHeights,
     channelYZoom,
+    channelYRange,
     overviewChannelId,
     windowSeconds,
     viewStart,
     panelHeight,
     activeTab,
   ])
+
+  const getChannelPlotWidth = useCallback(
+    () => Math.max(canvasSize.width - PLOT_PADDING.left - PLOT_PADDING.right, 1),
+    [canvasSize.width]
+  )
+
+  const readChannelDisplayRange = useCallback((channelId) => {
+    const channel = channelById[channelId]
+    if (!channel) return null
+
+    return getChannelDisplayRange({
+      channel,
+      viewStart: viewRangeRef.current.viewStart,
+      viewEnd: viewRangeRef.current.viewEnd,
+      plotWidth: getChannelPlotWidth(),
+      channelYZoom: channelYZoomRef.current,
+      channelYRange: channelYRangeRef.current,
+    })
+  }, [channelById, getChannelPlotWidth])
+
+  const openYRangeDialog = useCallback((channelId) => {
+    const channel = channelById[channelId]
+    if (!channel || getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
+
+    const display = readChannelDisplayRange(channelId)
+    if (!display) return
+
+    setYRangeDialog({
+      channelId,
+      channelLabel: channel.label,
+      min: display.displayMin,
+      max: display.displayMax,
+    })
+  }, [channelById, readChannelDisplayRange, getChannelFormat])
+
+  const handleYRangeDialogApply = useCallback((min, max) => {
+    if (!yRangeDialog) return
+
+    const { channelId } = yRangeDialog
+    setChannelYRange((prev) => ({ ...prev, [channelId]: { min, max } }))
+    setChannelYZoom((prev) => {
+      if (!prev[channelId]) return prev
+      const next = { ...prev }
+      delete next[channelId]
+      return next
+    })
+    setYRangeDialog(null)
+  }, [yRangeDialog])
+
+  const handleYRangeDialogReset = useCallback(() => {
+    if (!yRangeDialog) return
+
+    const { channelId } = yRangeDialog
+    setChannelYRange((prev) => {
+      const next = { ...prev }
+      delete next[channelId]
+      return next
+    })
+    setChannelYZoom((prev) => {
+      if (!prev[channelId]) return prev
+      const next = { ...prev }
+      delete next[channelId]
+      return next
+    })
+    setYRangeDialog(null)
+  }, [yRangeDialog])
+
+  const handleChannelYRangeContextMenu = useCallback((event, channelId) => {
+    if (getChannelFormat(channelId) === DEPICTION_FORMATS.BINARY_MASK) return
+    event.preventDefault()
+    event.stopPropagation()
+    openYRangeDialog(channelId)
+  }, [getChannelFormat, openYRangeDialog])
 
   const handleSavePreset = async () => {
     setPresetError('')
@@ -970,29 +1380,140 @@ const SignalViewer = ({ edfData, onBack }) => {
     }
   }
 
+  const buildMergedEdfBuffer = useCallback(() => {
+    const getData = (channelId) => getMaskData(channelId)
+    const hasMaskEdits = Object.keys(maskOverridesRef.current).length > 0
+
+    if (!hasMaskEdits && edfData.rawBuffer) {
+      return edfData.rawBuffer
+    }
+
+    return buildEdfBuffer(
+      edfData,
+      edfData.channels.map((channel) => channel.id),
+      getData
+    )
+  }, [edfData, getMaskData])
+
+  const performSaveEdf = useCallback(async ({ replaceRecordIds = [], saveAsNew = false } = {}) => {
+    setEdfSaveError('')
+    setEdfSaveMessage('')
+
+    const mergedBuffer = buildMergedEdfBuffer()
+    const summary = buildEdfSummary(edfData)
+    const fileName = edfData.fileName
+
+    for (const recordId of replaceRecordIds) {
+      if (recordId !== savedRecordIdRef.current) {
+        await deleteEdfRecord(recordId)
+      }
+    }
+
+    let id = savedRecordIdRef.current
+    if (saveAsNew || !id) {
+      id = await saveEdfRecord(fileName, mergedBuffer, summary)
+    } else {
+      await updateEdfRecord(id, fileName, mergedBuffer, summary)
+    }
+
+    setSavedRecordId(id)
+    savedRecordIdRef.current = id
+    await persistAllMaskOverrides(id)
+    setEdfSaveMessage(
+      saveAsNew
+        ? `Saved "${fileName}" as a new IndexedDB copy`
+        : `Saved "${fileName}" to IndexedDB`
+    )
+    return id
+  }, [edfData, buildMergedEdfBuffer, persistAllMaskOverrides])
+
+  const resolveSaveEdfPromise = useCallback((error = null) => {
+    const resolvers = saveEdfResolversRef.current
+    if (!resolvers) return
+
+    if (error) {
+      resolvers.reject(error)
+    } else {
+      resolvers.resolve()
+    }
+
+    saveEdfResolversRef.current = null
+  }, [])
+
+  const handleSaveEdfConflictCancel = useCallback(() => {
+    setSaveConflict(null)
+    resolveSaveEdfPromise(new Error('Save cancelled'))
+  }, [resolveSaveEdfPromise])
+
+  const handleSaveEdfConflictReplace = useCallback(async () => {
+    if (!saveConflict) return
+
+    setIsSavingEdf(true)
+    try {
+      await performSaveEdf({
+        replaceRecordIds: saveConflict.duplicates.map((record) => record.id),
+      })
+      setSaveConflict(null)
+      resolveSaveEdfPromise()
+    } catch (error) {
+      setEdfSaveError(error.message || 'Failed to save EDF')
+      setSaveConflict(null)
+      resolveSaveEdfPromise(error)
+    } finally {
+      setIsSavingEdf(false)
+    }
+  }, [saveConflict, performSaveEdf, resolveSaveEdfPromise])
+
+  const handleSaveEdfConflictSaveAsNew = useCallback(async () => {
+    setIsSavingEdf(true)
+    try {
+      await performSaveEdf({ saveAsNew: true })
+      setSaveConflict(null)
+      resolveSaveEdfPromise()
+    } catch (error) {
+      setEdfSaveError(error.message || 'Failed to save EDF')
+      setSaveConflict(null)
+      resolveSaveEdfPromise(error)
+    } finally {
+      setIsSavingEdf(false)
+    }
+  }, [performSaveEdf, resolveSaveEdfPromise])
+
   const handleSaveEdf = async () => {
     setEdfSaveError('')
     setEdfSaveMessage('')
 
-    if (!edfData.rawBuffer) {
-      setEdfSaveError('No raw file data available to save')
-      return
+    if (!edfData.rawBuffer && Object.keys(maskOverridesRef.current).length === 0) {
+      const error = new Error('No raw file data available to save')
+      setEdfSaveError(error.message)
+      throw error
+    }
+
+    const existing = await findEdfRecordsByFileName(edfData.fileName)
+    const duplicates = existing.filter((record) => record.id !== savedRecordIdRef.current)
+
+    if (duplicates.length > 0) {
+      return new Promise((resolve, reject) => {
+        saveEdfResolversRef.current = { resolve, reject }
+        setSaveConflict({ duplicates })
+      })
     }
 
     setIsSavingEdf(true)
     try {
-      const id = await saveEdfRecord(
-        edfData.fileName,
-        edfData.rawBuffer,
-        buildEdfSummary(edfData)
-      )
-      setEdfSaveMessage(`Saved "${edfData.fileName}" to IndexedDB`)
+      await performSaveEdf()
     } catch (error) {
       setEdfSaveError(error.message || 'Failed to save EDF')
+      throw error
     } finally {
       setIsSavingEdf(false)
     }
   }
+
+  const hasPendingExportChanges = useMemo(
+    () => Object.keys(maskOverrides).length > 0 || !savedRecordId,
+    [maskOverrides, savedRecordId]
+  )
 
   useEffect(() => {
     const container = containerRef.current
@@ -1071,7 +1592,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       color: getBinaryMaskColor(maskIndex),
       overlayTargets: getBinaryMaskOverlayTargets(channel.id),
       segments: getBinaryMaskSegments(
-        channel.data,
+        getMaskData(channel.id),
         viewStart * channel.sampleRate,
         viewEnd * channel.sampleRate,
         plotWidth
@@ -1124,7 +1645,8 @@ const SignalViewer = ({ edfData, onBack }) => {
       if (format === DEPICTION_FORMATS.BINARY_MASK) {
         const maskIndex = binaryMaskChannels.findIndex((maskChannel) => maskChannel.id === channel.id)
         const color = getBinaryMaskColor(Math.max(maskIndex, 0))
-        const ownSegments = getBinaryMaskSegments(channel.data, startSample, endSample, plotWidth)
+        const maskData = getMaskData(channel.id)
+        const ownSegments = getBinaryMaskSegments(maskData, startSample, endSample, plotWidth)
         drawBinaryMaskSegments(
           ctx,
           ownSegments,
@@ -1136,31 +1658,56 @@ const SignalViewer = ({ edfData, onBack }) => {
           color.stroke
         )
 
+        if (
+          maskSelection?.channelId === channel.id &&
+          maskSelection.startSample !== undefined &&
+          maskSelection.endSample !== undefined
+        ) {
+          const selStartTime = Math.min(maskSelection.startSample, maskSelection.endSample) / channel.sampleRate
+          const selEndTime = Math.max(maskSelection.startSample, maskSelection.endSample) / channel.sampleRate
+          const x1 = padding.left + ((Math.max(selStartTime, viewStart) - viewStart) / windowSeconds) * plotWidth
+          const x2 = padding.left + ((Math.min(selEndTime, viewEnd) - viewStart) / windowSeconds) * plotWidth
+          const selWidth = Math.max(x2 - x1, 2)
+
+          ctx.fillStyle = 'rgba(102, 126, 234, 0.25)'
+          ctx.fillRect(x1, yTop + 2, selWidth, yBottom - yTop - 4)
+          ctx.strokeStyle = '#667eea'
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([4, 3])
+          ctx.strokeRect(x1, yTop + 2, selWidth, yBottom - yTop - 4)
+          ctx.setLineDash([])
+        }
+
         ctx.fillStyle = '#a0aec0'
         ctx.font = '10px Inter, sans-serif'
         ctx.textAlign = 'left'
         ctx.textBaseline = 'top'
-        ctx.fillText('0 / 1 mask', padding.left + 4, yTop + 4)
+        ctx.fillText('0 / 1 mask · click event to delete, drag to add', padding.left + 4, yTop + 4)
         ctx.restore()
         return
       }
 
-      const samples = downsampleRange(channel.data, startSample, endSample, plotWidth)
+      const {
+        displayMin,
+        displayMax,
+        displayRange,
+        isCustom,
+        samples,
+      } = getChannelDisplayRange({
+        channel,
+        viewStart,
+        viewEnd,
+        plotWidth,
+        channelYZoom,
+        channelYRange,
+      })
 
       if (samples.length === 0) {
         ctx.restore()
         return
       }
 
-      let minVal = Infinity
-      let maxVal = -Infinity
-      samples.forEach(({ min, max }) => {
-        if (min < minVal) minVal = min
-        if (max > maxVal) maxVal = max
-      })
-
       const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
-      const { displayMin, displayMax, displayRange } = getVisibleValueRange(minVal, maxVal, yZoom)
       const color = CHANNEL_COLORS[stripIndex % CHANNEL_COLORS.length]
 
       ctx.strokeStyle = color
@@ -1188,9 +1735,10 @@ const SignalViewer = ({ edfData, onBack }) => {
       ctx.font = '10px Inter, sans-serif'
       ctx.textAlign = 'left'
       ctx.textBaseline = 'top'
-      const zoomLabel = yZoom !== DEFAULT_Y_ZOOM ? ` · ${yZoom.toFixed(1)}x` : ''
+      const zoomLabel = !isCustom && yZoom !== DEFAULT_Y_ZOOM ? ` · ${yZoom.toFixed(1)}x` : ''
+      const customLabel = isCustom ? ' · fixed' : ''
       ctx.fillText(
-        `${displayMin.toFixed(1)} – ${displayMax.toFixed(1)}${zoomLabel}`,
+        `${displayMin.toFixed(1)} – ${displayMax.toFixed(1)}${zoomLabel}${customLabel}`,
         padding.left + 4,
         yTop + 4
       )
@@ -1206,7 +1754,7 @@ const SignalViewer = ({ edfData, onBack }) => {
       width / 2,
       height - 20
     )
-  }, [edfData, selectedChannels, channelById, channelFormats, channelStripHeights, channelYZoom, overviewChannel, binaryMaskChannels, getChannelFormat, getBinaryMaskOverlayTargets, viewStart, viewEnd, totalDuration, canvasSize.width, canvasSize.height])
+  }, [edfData, selectedChannels, channelById, channelFormats, channelStripHeights, channelYZoom, channelYRange, overviewChannel, binaryMaskChannels, getChannelFormat, getBinaryMaskOverlayTargets, getMaskData, maskSelection, viewStart, viewEnd, windowSeconds, totalDuration, canvasSize.width, canvasSize.height])
 
   useEffect(() => {
     if (canvasSize.width > 0) {
@@ -1263,6 +1811,81 @@ const SignalViewer = ({ edfData, onBack }) => {
     })
   }
 
+  const onMaskEditMoveRef = useRef(() => {})
+  const completeMaskEditDragRef = useRef(() => {})
+
+  const completeMaskEditDrag = useCallback(() => {
+    const drag = maskEditDragRef.current
+    if (drag) {
+      const data = maskOverridesRef.current[drag.channelId] ?? channelById[drag.channelId]?.data
+      if (data) {
+        const next = fillEventRange(data, drag.startSample, drag.endSample)
+        updateMaskAndSave(drag.channelId, next)
+      }
+    }
+
+    maskEditDragRef.current = null
+    setMaskSelection(null)
+    document.body.classList.remove('signal-viewer-mask-editing')
+    detachDocumentDragListeners(onMaskEditMoveRef.current, completeMaskEditDragRef.current)
+  }, [channelById, updateMaskAndSave])
+
+  completeMaskEditDragRef.current = completeMaskEditDrag
+
+  const onMaskEditMove = useCallback((event) => {
+    const drag = maskEditDragRef.current
+    if (!drag) return
+
+    const canvas = canvasRef.current
+    const channel = channelById[drag.channelId]
+    if (!canvas || !channel) return
+
+    const { viewStart: vs, viewEnd: ve } = viewRangeRef.current
+    const time = clientXToTime(event.clientX, canvas, vs, ve)
+    const sampleIndex = timeToSampleIndex(time, channel.sampleRate, drag.dataLength)
+
+    maskEditDragRef.current = { ...drag, endSample: sampleIndex }
+    setMaskSelection({
+      channelId: drag.channelId,
+      startSample: drag.startSample,
+      endSample: sampleIndex,
+    })
+  }, [channelById])
+
+  onMaskEditMoveRef.current = onMaskEditMove
+
+  const handleBinaryMaskMouseDown = useCallback((event, channelId) => {
+    event.preventDefault()
+    event.stopPropagation()
+
+    const canvas = canvasRef.current
+    const channel = channelById[channelId]
+    if (!canvas || !channel) return
+
+    const data = maskOverridesRef.current[channelId] ?? channel.data
+    const { viewStart: vs, viewEnd: ve } = viewRangeRef.current
+    const time = clientXToTime(event.clientX, canvas, vs, ve)
+    const sampleIndex = timeToSampleIndex(time, channel.sampleRate, data.length)
+
+    if (isActiveBinary(data[sampleIndex])) {
+      const next = clearEventAt(data, sampleIndex)
+      if (next) {
+        updateMaskAndSave(channelId, next)
+      }
+      return
+    }
+
+    maskEditDragRef.current = {
+      channelId,
+      startSample: sampleIndex,
+      endSample: sampleIndex,
+      dataLength: data.length,
+    }
+    setMaskSelection({ channelId, startSample: sampleIndex, endSample: sampleIndex })
+    document.body.classList.add('signal-viewer-mask-editing')
+    attachDocumentDragListeners(onMaskEditMoveRef.current, completeMaskEditDragRef.current)
+  }, [channelById, updateMaskAndSave])
+
   const zoomIn = () => {
     setWindowSeconds((prev) => Math.max(MIN_WINDOW_SECONDS, prev / 2))
   }
@@ -1301,9 +1924,6 @@ const SignalViewer = ({ edfData, onBack }) => {
   }, [navigateOverviewToClientX])
 
   const handleOverviewWheel = useCallback((event) => {
-    event.preventDefault()
-    event.stopPropagation()
-
     const canvas = canvasRef.current
     if (!canvas) return
 
@@ -1335,15 +1955,57 @@ const SignalViewer = ({ edfData, onBack }) => {
     setViewStart(newViewStart)
   }, [totalDuration, windowSeconds])
 
+  const handleOverviewWheelRef = useRef(handleOverviewWheel)
+  handleOverviewWheelRef.current = handleOverviewWheel
+
+  useEffect(() => {
+    const overview = overviewStripRef.current
+    if (!overview) return undefined
+
+    const handleWheel = (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      handleOverviewWheelRef.current(event)
+    }
+
+    overview.addEventListener('wheel', handleWheel, { passive: false })
+    return () => overview.removeEventListener('wheel', handleWheel)
+  }, [overviewStripLayout, overviewChannel])
+
   const handleChannelYZoomWheel = useCallback((event, channelId) => {
+    const channel = channelById[channelId]
+    if (!channel) return
+
     const zoomFactor = Y_WHEEL_ZOOM_BASE ** (-event.deltaY / 100)
+    const display = getChannelDisplayRange({
+      channel,
+      viewStart: viewRangeRef.current.viewStart,
+      viewEnd: viewRangeRef.current.viewEnd,
+      plotWidth: Math.max(canvasSize.width - PLOT_PADDING.left - PLOT_PADDING.right, 1),
+      channelYZoom: channelYZoomRef.current,
+      channelYRange: channelYRangeRef.current,
+    })
+
+    if (channelYRangeRef.current[channelId]) {
+      const center = (display.displayMin + display.displayMax) / 2
+      const nextHalfRange = display.displayRange / 2 / zoomFactor
+      setChannelYRange((prev) => ({
+        ...prev,
+        [channelId]: {
+          min: center - nextHalfRange,
+          max: center + nextHalfRange,
+        },
+      }))
+      return
+    }
+
     setChannelYZoom((prev) => {
       const current = prev[channelId] ?? DEFAULT_Y_ZOOM
       const next = Math.max(MIN_Y_ZOOM, Math.min(MAX_Y_ZOOM, current * zoomFactor))
       if (next === current) return prev
       return { ...prev, [channelId]: next }
     })
-  }, [])
+  }, [channelById, canvasSize.width])
 
   const handleChannelYZoomWheelRef = useRef(handleChannelYZoomWheel)
   handleChannelYZoomWheelRef.current = handleChannelYZoomWheel
@@ -1370,13 +2032,17 @@ const SignalViewer = ({ edfData, onBack }) => {
 
   const endDrag = useCallback(() => {
     const wasReordering = dragStateRef.current?.type === 'channel-reorder'
+    const wasPanningYCenter = dragStateRef.current?.type === 'channel-y-center'
     dragStateRef.current = null
     document.body.classList.remove('signal-viewer-dragging')
     document.body.classList.remove('signal-viewer-reordering')
-    document.removeEventListener('mousemove', onDragMoveRef.current)
-    document.removeEventListener('mouseup', endDragRef.current)
+    document.body.classList.remove('signal-viewer-y-panning')
+    detachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
     if (wasReordering) {
       setReorderingChannelId(null)
+    }
+    if (wasPanningYCenter) {
+      setPanningYCenterChannelId(null)
     }
   }, [])
 
@@ -1405,27 +2071,34 @@ const SignalViewer = ({ edfData, onBack }) => {
     if (drag.type === 'channel') {
       const canvas = canvasRef.current
       const channels = activeChannelsRef.current
-      if (!canvas || channels.length <= drag.channelIndex + 1) return
+      if (!canvas) return
+      if (!drag.isBottomEdge && channels.length <= drag.channelIndex + 1) return
 
       const rect = canvas.getBoundingClientRect()
       if (rect.height <= 0) return
 
       const scaleY = canvas.height / rect.height
       const deltaCanvas = (event.clientY - drag.startY) * scaleY
-      const upperId = channels[drag.channelIndex].id
-      const lowerId = channels[drag.channelIndex + 1].id
-      const clampedDelta = Math.max(
-        MIN_CHANNEL_STRIP_HEIGHT - drag.startUpperHeight,
-        Math.min(deltaCanvas, drag.startLowerHeight - MIN_CHANNEL_STRIP_HEIGHT)
-      )
+      if (Math.abs(deltaCanvas) < 0.5) return
 
-      if (clampedDelta === 0) return
+      const upperId = channels[drag.channelIndex].id
+      const nextUpperHeight = Math.max(
+        MIN_CHANNEL_STRIP_HEIGHT,
+        drag.startUpperHeight + deltaCanvas
+      )
+      const heightDelta = nextUpperHeight - drag.startUpperHeight
+      if (heightDelta === 0) return
+
+      const nextPanelHeight = Math.max(
+        MIN_PANEL_HEIGHT,
+        drag.startPanelHeight + heightDelta
+      )
 
       setChannelStripHeights((prev) => ({
         ...prev,
-        [upperId]: drag.startUpperHeight + clampedDelta,
-        [lowerId]: drag.startLowerHeight - clampedDelta,
+        [upperId]: nextUpperHeight,
       }))
+      setPanelHeight(nextPanelHeight)
       return
     }
 
@@ -1445,13 +2118,45 @@ const SignalViewer = ({ edfData, onBack }) => {
 
       const next = reorderArray(selectedChannelsRef.current, fromIndex, targetIndex)
       selectedChannelsRef.current = next
+      activeChannelsRef.current = next
+        .map((id) => channelByIdRef.current[id])
+        .filter(Boolean)
       setSelectedChannels(next)
+      return
+    }
+
+    if (drag.type === 'channel-y-center') {
+      const canvas = canvasRef.current
+      if (!canvas) return
+
+      const rect = canvas.getBoundingClientRect()
+      if (rect.height <= 0 || drag.stripHeight <= 0) return
+
+      const scaleY = canvas.height / rect.height
+      const deltaCanvas = (event.clientY - drag.startY) * scaleY
+      const valuePerPixel = drag.displayRange / drag.stripHeight
+      const deltaValue = -deltaCanvas * valuePerPixel
+
+      setChannelYRange((prev) => ({
+        ...prev,
+        [drag.channelId]: {
+          min: drag.startMin + deltaValue,
+          max: drag.startMax + deltaValue,
+        },
+      }))
+      setChannelYZoom((prev) => {
+        if (!prev[drag.channelId]) return prev
+        const next = { ...prev }
+        delete next[drag.channelId]
+        return next
+      })
     }
   }, [])
 
   onDragMoveRef.current = onDragMove
 
   const startPanelResize = useCallback((event) => {
+    if (!isPrimaryPointerButton(event)) return
     event.preventDefault()
     dragStateRef.current = {
       type: 'panel',
@@ -1460,13 +2165,17 @@ const SignalViewer = ({ edfData, onBack }) => {
       startStripHeights: { ...channelStripHeightsRef.current },
     }
     document.body.classList.add('signal-viewer-dragging')
-    document.addEventListener('mousemove', onDragMoveRef.current)
-    document.addEventListener('mouseup', endDragRef.current)
+    attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [])
 
   const startChannelReorder = useCallback((event, channelId) => {
+    if (!isPrimaryPointerButton(event)) return
     event.preventDefault()
     event.stopPropagation()
+
+    if (event.currentTarget.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    }
 
     dragStateRef.current = {
       type: 'channel-reorder',
@@ -1476,11 +2185,39 @@ const SignalViewer = ({ edfData, onBack }) => {
     setReorderingChannelId(channelId)
     document.body.classList.add('signal-viewer-dragging')
     document.body.classList.add('signal-viewer-reordering')
-    document.addEventListener('mousemove', onDragMoveRef.current)
-    document.addEventListener('mouseup', endDragRef.current)
+    attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [])
 
+  const startChannelYCenterDrag = useCallback((event, channelId) => {
+    if (!isPrimaryPointerButton(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (event.currentTarget.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    }
+
+    const display = readChannelDisplayRange(channelId)
+    const stripHeight = getChannelStripHeight(channelStripHeightsRef.current, channelId)
+    if (!display || stripHeight <= 0) return
+
+    dragStateRef.current = {
+      type: 'channel-y-center',
+      channelId,
+      startY: event.clientY,
+      startMin: display.displayMin,
+      startMax: display.displayMax,
+      displayRange: display.displayRange,
+      stripHeight,
+    }
+    setPanningYCenterChannelId(channelId)
+    document.body.classList.add('signal-viewer-dragging')
+    document.body.classList.add('signal-viewer-y-panning')
+    attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
+  }, [readChannelDisplayRange])
+
   const startChannelResize = useCallback((event, channelIndex) => {
+    if (!isPrimaryPointerButton(event)) return
     event.preventDefault()
     event.stopPropagation()
 
@@ -1489,26 +2226,50 @@ const SignalViewer = ({ edfData, onBack }) => {
 
     const heights = channelStripHeightsRef.current
     const upperId = channels[channelIndex].id
-    const lowerId = channels[channelIndex + 1].id
 
     dragStateRef.current = {
       type: 'channel',
       channelIndex,
       startY: event.clientY,
       startUpperHeight: getChannelStripHeight(heights, upperId),
-      startLowerHeight: getChannelStripHeight(heights, lowerId),
+      startPanelHeight: panelHeightRef.current,
     }
     document.body.classList.add('signal-viewer-dragging')
-    document.addEventListener('mousemove', onDragMoveRef.current)
-    document.addEventListener('mouseup', endDragRef.current)
+    attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
+  }, [])
+
+  const startLastChannelBottomResize = useCallback((event) => {
+    if (!isPrimaryPointerButton(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    const channels = activeChannelsRef.current
+    if (channels.length === 0) return
+
+    const lastIndex = channels.length - 1
+    const channelId = channels[lastIndex].id
+    const heights = channelStripHeightsRef.current
+
+    dragStateRef.current = {
+      type: 'channel',
+      channelIndex: lastIndex,
+      isBottomEdge: true,
+      startY: event.clientY,
+      startUpperHeight: getChannelStripHeight(heights, channelId),
+      startPanelHeight: panelHeightRef.current,
+    }
+    document.body.classList.add('signal-viewer-dragging')
+    attachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
   }, [])
 
   useEffect(() => {
     return () => {
-      document.removeEventListener('mousemove', onDragMoveRef.current)
-      document.removeEventListener('mouseup', endDragRef.current)
+      detachDocumentDragListeners(onDragMoveRef.current, endDragRef.current)
+      detachDocumentDragListeners(onMaskEditMoveRef.current, completeMaskEditDragRef.current)
       document.body.classList.remove('signal-viewer-dragging')
       document.body.classList.remove('signal-viewer-reordering')
+      document.body.classList.remove('signal-viewer-y-panning')
+      document.body.classList.remove('signal-viewer-mask-editing')
     }
   }, [])
 
@@ -1556,6 +2317,23 @@ const SignalViewer = ({ edfData, onBack }) => {
     return () => canvas.removeEventListener('wheel', handleWheel)
   }, [viewStart, windowSeconds, totalDuration])
 
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (activeTab !== VIEWER_TABS.VIEWER) return
+      if (event.target.closest('input, textarea, select')) return
+
+      const isUndo = (event.ctrlKey || event.metaKey) && event.key === 'z' && !event.shiftKey
+      if (!isUndo) return
+      if (maskHistoryRef.current.length === 0) return
+
+      event.preventDefault()
+      undoMaskEdit()
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [activeTab, undoMaskEdit])
+
   return (
     <section className="viewer-section">
       <div className="viewer-header">
@@ -1574,9 +2352,16 @@ const SignalViewer = ({ edfData, onBack }) => {
             onClick={handleSaveEdf}
             disabled={isSavingEdf || !edfData.rawBuffer}
             type="button"
-            title={edfData.rawBuffer ? 'Save raw EDF bytes to IndexedDB' : 'Raw file data unavailable'}
+            title={edfData.rawBuffer ? 'Save EDF with merged mask edits to IndexedDB' : 'Raw file data unavailable'}
           >
             {isSavingEdf ? 'Saving...' : 'Save EDF'}
+          </button>
+          <button
+            className="btn btn-secondary"
+            onClick={() => setIsExportDialogOpen(true)}
+            type="button"
+          >
+            Export Data
           </button>
           <button className="btn btn-secondary" onClick={onBack} type="button">
             ← Back to Upload
@@ -1620,7 +2405,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                       width={canvasSize.width}
                       height={canvasSize.height}
                       className="signal-canvas"
-                      title="Scroll on the plot to zoom time. Use the left strip to reorder channels (drag) or zoom Y-axis (scroll). Click the full sequence strip to jump."
+                      title="Scroll on the plot to zoom time. Left strip: drag ⋮⋮ to reorder, scroll to zoom Y-axis, drag ◆ to shift range, right-click to set Y range."
                     />
                     {overviewStripLayout && overviewChannel ? (
                       <>
@@ -1640,6 +2425,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                           </span>
                         </div>
                         <div
+                          ref={overviewStripRef}
                           className="overview-strip-region"
                           style={{
                             top: `${overviewStripLayout.topPercent}%`,
@@ -1648,7 +2434,6 @@ const SignalViewer = ({ edfData, onBack }) => {
                             right: PLOT_PADDING.right,
                           }}
                           onClick={handleOverviewClick}
-                          onWheel={handleOverviewWheel}
                           title={`Full sequence · ${overviewChannel.label}. Click to jump, scroll to zoom time.`}
                           aria-label={`Full sequence navigation for ${overviewChannel.label}`}
                         />
@@ -1656,19 +2441,31 @@ const SignalViewer = ({ edfData, onBack }) => {
                     ) : null}
                     {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
                       const format = getChannelFormat(channel.id)
+                      const isBinaryMask = format === DEPICTION_FORMATS.BINARY_MASK
                       const unit = channel.physicalDimension ? ` ${channel.physicalDimension}` : ''
-                      const formatLabel = format === DEPICTION_FORMATS.BINARY_MASK ? ' [mask]' : ''
+                      const formatLabel = isBinaryMask ? ' [mask]' : ''
                       const labelText = `${channel.label}${unit}${formatLabel}`
 
                       return (
                         <div
                           key={`label-${channel.id}`}
-                          className="channel-strip-label"
+                          className="channel-strip-label channel-strip-label-reorder"
                           style={{
                             top: `${topPercent}%`,
                             height: `${heightPercent}%`,
                             width: PLOT_PADDING.left,
                           }}
+                          title={
+                            isBinaryMask
+                              ? `${labelText} · drag to reorder`
+                              : `${labelText} · drag to reorder · right-click to set Y-axis range`
+                          }
+                          onPointerDown={(event) => startChannelReorder(event, channel.id)}
+                          onContextMenu={
+                            isBinaryMask
+                              ? undefined
+                              : (event) => handleChannelYRangeContextMenu(event, channel.id)
+                          }
                         >
                           <span className="channel-strip-label-text" title={labelText}>
                             {labelText}
@@ -1679,15 +2476,17 @@ const SignalViewer = ({ edfData, onBack }) => {
                     {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
                       const isBinaryMask = getChannelFormat(channel.id) === DEPICTION_FORMATS.BINARY_MASK
                       const yZoom = channelYZoom[channel.id] ?? DEFAULT_Y_ZOOM
+                      const hasCustomRange = Boolean(channelYRange[channel.id])
                       const isDragging = reorderingChannelId === channel.id
+                      const isPanning = panningYCenterChannelId === channel.id
                       const regionTitle = isBinaryMask
-                        ? `Drag to reorder ${channel.label}`
-                        : `Drag to reorder · scroll to zoom Y-axis (${yZoom.toFixed(1)}x)`
+                        ? `Drag ⋮⋮ to reorder ${channel.label}`
+                        : `Drag ⋮⋮ to reorder · scroll to zoom Y-axis${hasCustomRange ? '' : ` (${yZoom.toFixed(1)}x)`} · drag ◆ to shift range · right-click to set range`
 
                       return (
                         <div
                           key={channel.id}
-                          className={`channel-yzoom-region${isDragging ? ' channel-yzoom-region-dragging' : ''}`}
+                          className={`channel-yzoom-region${isDragging ? ' channel-yzoom-region-dragging' : ''}${isPanning ? ' channel-yzoom-region-panning' : ''}`}
                           data-channel-id={channel.id}
                           style={{
                             top: `${topPercent}%`,
@@ -1696,8 +2495,49 @@ const SignalViewer = ({ edfData, onBack }) => {
                             width: Y_VALUE_REGION_WIDTH,
                           }}
                           title={regionTitle}
-                          aria-label={`Reorder ${channel.label}${isBinaryMask ? '' : `, Y-axis zoom ${yZoom.toFixed(1)}x`}`}
-                          onMouseDown={(event) => startChannelReorder(event, channel.id)}
+                          aria-label={`Y-axis controls for ${channel.label}`}
+                          onContextMenu={
+                            isBinaryMask
+                              ? undefined
+                              : (event) => handleChannelYRangeContextMenu(event, channel.id)
+                          }
+                        >
+                          <div
+                            className="channel-yzoom-reorder-handle"
+                            title={`Drag to reorder ${channel.label}`}
+                            aria-label={`Reorder ${channel.label}`}
+                            onPointerDown={(event) => startChannelReorder(event, channel.id)}
+                          >
+                            ⋮⋮
+                          </div>
+                          {!isBinaryMask ? (
+                            <div
+                              className="channel-y-center-handle"
+                              style={{ top: '50%' }}
+                              title="Drag to shift Y-axis value range"
+                              aria-label={`Shift Y-axis range for ${channel.label}`}
+                              onPointerDown={(event) => startChannelYCenterDrag(event, channel.id)}
+                            />
+                          ) : null}
+                        </div>
+                      )
+                    })}
+                    {channelStripLayouts.map(({ channel, topPercent, heightPercent }) => {
+                      if (getChannelFormat(channel.id) !== DEPICTION_FORMATS.BINARY_MASK) return null
+
+                      return (
+                        <div
+                          key={`mask-edit-${channel.id}`}
+                          className="binary-mask-edit-region"
+                          style={{
+                            top: `${topPercent}%`,
+                            height: `${heightPercent}%`,
+                            left: PLOT_PADDING.left + Y_VALUE_REGION_WIDTH,
+                            right: PLOT_PADDING.right,
+                          }}
+                          onMouseDown={(event) => handleBinaryMaskMouseDown(event, channel.id)}
+                          title={`${channel.label}: click event to delete, drag empty area to add event`}
+                          aria-label={`Edit binary mask for ${channel.label}`}
                         />
                       )
                     })}
@@ -1706,17 +2546,28 @@ const SignalViewer = ({ edfData, onBack }) => {
                         key={channelIndex}
                         className="channel-resize-handle"
                         style={{ top: `${percent}%` }}
-                        onMouseDown={(event) => startChannelResize(event, channelIndex)}
+                        onPointerDown={(event) => startChannelResize(event, channelIndex)}
                         role="separator"
                         aria-orientation="horizontal"
-                        aria-label={`Resize ${activeChannels[channelIndex]?.label} and ${activeChannels[channelIndex + 1]?.label}`}
+                        aria-label={`Resize ${activeChannels[channelIndex]?.label} height`}
                       />
                     ))}
+                    {lastChannelBottomPercent !== null ? (
+                      <div
+                        key="last-channel-bottom"
+                        className="channel-resize-handle channel-resize-handle-bottom"
+                        style={{ top: `${lastChannelBottomPercent}%` }}
+                        onPointerDown={startLastChannelBottomResize}
+                        role="separator"
+                        aria-orientation="horizontal"
+                        aria-label={`Resize ${activeChannels[activeChannels.length - 1]?.label} height`}
+                      />
+                    ) : null}
                   </div>
                 </div>
                 <div
                   className="panel-resize-handle"
-                  onMouseDown={startPanelResize}
+                  onPointerDown={startPanelResize}
                   role="separator"
                   aria-orientation="horizontal"
                   aria-label="Resize signal viewer panel"
@@ -1728,6 +2579,17 @@ const SignalViewer = ({ edfData, onBack }) => {
                 <button className="btn btn-small" onClick={zoomOut} type="button">🔍-</button>
                 <button className="btn btn-small" onClick={panLeft} type="button">←</button>
                 <button className="btn btn-small" onClick={panRight} type="button">→</button>
+                {binaryMaskChannels.length > 0 ? (
+                  <button
+                    className="btn btn-small"
+                    onClick={undoMaskEdit}
+                    disabled={!canUndoMaskEdit}
+                    type="button"
+                    title="Undo last mask edit (Ctrl+Z)"
+                  >
+                    ↩ Undo
+                  </button>
+                ) : null}
                 <span className="time-info">
                   Window: {viewStart.toFixed(0)}s – {viewEnd.toFixed(0)}s ({windowSeconds}s)
                 </span>
@@ -1746,7 +2608,7 @@ const SignalViewer = ({ edfData, onBack }) => {
                 <p className="view-presets-hint">
                   Save all viewer settings to IndexedDB: full sequence channel, channel order, channels,
                   depiction formats, binary mask overlays, time zoom, panel height, channel strip heights,
-                  Y-axis zoom, and active tab.
+                  Y-axis zoom, Y-axis value ranges, and active tab.
                 </p>
               </div>
 
@@ -1978,6 +2840,37 @@ const SignalViewer = ({ edfData, onBack }) => {
           </div>
         </div>
       </div>
+
+      <ChannelYRangeDialog
+        isOpen={Boolean(yRangeDialog)}
+        channelLabel={yRangeDialog?.channelLabel ?? ''}
+        initialMin={yRangeDialog?.min ?? 0}
+        initialMax={yRangeDialog?.max ?? 1}
+        onClose={() => setYRangeDialog(null)}
+        onApply={handleYRangeDialogApply}
+        onReset={handleYRangeDialogReset}
+      />
+
+      <ExportDataDialog
+        isOpen={isExportDialogOpen}
+        onClose={() => setIsExportDialogOpen(false)}
+        channels={edfData.channels}
+        edfData={edfData}
+        getChannelData={getMaskData}
+        hasPendingChanges={hasPendingExportChanges}
+        onSaveEdf={handleSaveEdf}
+        isSavingEdf={isSavingEdf}
+      />
+
+      <SaveEdfConflictDialog
+        isOpen={Boolean(saveConflict)}
+        fileName={edfData.fileName}
+        duplicates={saveConflict?.duplicates ?? []}
+        isSaving={isSavingEdf}
+        onReplace={handleSaveEdfConflictReplace}
+        onSaveAsNew={handleSaveEdfConflictSaveAsNew}
+        onCancel={handleSaveEdfConflictCancel}
+      />
     </section>
   )
 }

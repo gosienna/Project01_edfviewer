@@ -71,6 +71,17 @@ export async function parseEdfFile(source) {
     data: [],
   }))
 
+  const expectedDataBytes = channels.reduce(
+    (sum, channel) => sum + header.numRecords * channel.samplesPerRecord * 2,
+    0
+  )
+  const expectedFileBytes = header.headerBytes + expectedDataBytes
+  if (expectedFileBytes > buffer.byteLength) {
+    throw new Error(
+      `Invalid EDF file: header expects ${expectedFileBytes} bytes but only ${buffer.byteLength} bytes are available`
+    )
+  }
+
   let offset = header.headerBytes
   for (let record = 0; record < header.numRecords; record += 1) {
     for (let channelIndex = 0; channelIndex < numSignals; channelIndex += 1) {

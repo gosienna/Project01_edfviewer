@@ -1,7 +1,8 @@
 export const DB_NAME = 'edfviewer'
-export const DB_VERSION = 2
+export const DB_VERSION = 4
 export const VIEW_PRESETS_STORE = 'viewPresets'
 export const EDF_RECORDS_STORE = 'edfRecords'
+export const BINARY_MASK_EDITS_STORE = 'binaryMaskEdits'
 
 export function openDb() {
   return new Promise((resolve, reject) => {
@@ -22,6 +23,14 @@ export function openDb() {
         const store = db.createObjectStore(EDF_RECORDS_STORE, { keyPath: 'id', autoIncrement: true })
         store.createIndex('fileName', 'fileName', { unique: false })
         store.createIndex('savedAt', 'savedAt', { unique: false })
+      }
+
+      if (!db.objectStoreNames.contains(BINARY_MASK_EDITS_STORE)) {
+        const store = db.createObjectStore(BINARY_MASK_EDITS_STORE, {
+          keyPath: ['recordId', 'channelLabel'],
+        })
+        store.createIndex('recordId', 'recordId', { unique: false })
+        store.createIndex('updatedAt', 'updatedAt', { unique: false })
       }
     }
   })

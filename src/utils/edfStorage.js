@@ -1,3 +1,4 @@
+import { deleteBinaryMaskEditsForRecord } from './binaryMaskStorage'
 import { EDF_RECORDS_STORE, openDb } from './edfDb'
 
 export function buildEdfSummary(edfData) {
@@ -23,6 +24,26 @@ export async function listEdfRecords() {
 
     request.onsuccess = () => {
       const records = request.result
+        .map(({ rawBuffer, ...rest }) => rest)
+        .sort((a, b) => b.savedAt - a.savedAt)
+      resolve(records)
+    }
+    request.onerror = () => reject(request.error)
+    tx.oncomplete = () => db.close()
+  })
+}
+
+export async function findEdfRecordsByFileName(fileName) {
+  const db = await openDb()
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EDF_RECORDS_STORE, 'readonly')
+    const store = tx.objectStore(EDF_RECORDS_STORE)
+    const index = store.index('fileName')
+    const request = index.getAll(fileName)
+
+    request.onsuccess = () => {
+      const records = (request.result ?? [])
         .map(({ rawBuffer, ...rest }) => rest)
         .sort((a, b) => b.savedAt - a.savedAt)
       resolve(records)
@@ -58,6 +79,33 @@ export async function saveEdfRecord(fileName, rawBuffer, summary) {
   })
 }
 
+export async function updateEdfRecord(id, fileName, rawBuffer, summary) {
+  if (!(rawBuffer instanceof ArrayBuffer)) {
+    throw new Error('Invalid EDF data')
+  }
+
+  const db = await openDb()
+  const now = Date.now()
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EDF_RECORDS_STORE, 'readwrite')
+    const store = tx.objectStore(EDF_RECORDS_STORE)
+    const request = store.put({
+      id,
+      fileName,
+      savedAt: now,
+      fileSizeBytes: rawBuffer.byteLength,
+      summary,
+      rawBuffer,
+    })
+
+    request.onsuccess = () => resolve(id)
+    request.onerror = () => reject(request.error)
+    tx.oncomplete = () => db.close()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
 export async function getEdfRecord(id) {
   const db = await openDb()
 
@@ -82,7 +130,7 @@ export async function getEdfRecord(id) {
 export async function deleteEdfRecord(id) {
   const db = await openDb()
 
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const tx = db.transaction(EDF_RECORDS_STORE, 'readwrite')
     const store = tx.objectStore(EDF_RECORDS_STORE)
     const request = store.delete(id)
@@ -92,4 +140,6 @@ export async function deleteEdfRecord(id) {
     tx.oncomplete = () => db.close()
     tx.onerror = () => reject(tx.error)
   })
+
+  await deleteBinaryMaskEditsForRecord(id)
 }
